@@ -2,7 +2,9 @@ name: Deploy GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "releases/**"
     tags: ["v*"]
   workflow_dispatch:
 
@@ -46,19 +48,34 @@ jobs:
       - name: Build tagged versions
         run: |
           mkdir -p _site/versions
-          mapfile -t tags < <(git tag --list 'v*' --sort=-version:refname)
+          declare -A version_refs
 
-          for tag in "${tags[@]}"; do
-            safe_tag="${tag//\//-}"
-            version_dir="${RUNNER_TEMP}/find-my-basic-${safe_tag}"
-            git worktree add --detach "$version_dir" "$tag"
+          while IFS= read -r tag; do
+            version_refs["$tag"]="$tag"
+          done < <(git tag --list 'v*')
+
+          while IFS= read -r branch; do
+            version="${branch#origin/releases/}"
+            version_refs["$version"]="$branch"
+          done < <(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/releases/v*')
+
+          versions=()
+          if (( ${#version_refs[@]} > 0 )); then
+            mapfile -t versions < <(printf '%s\n' "${!version_refs[@]}" | sort -Vr)
+          fi
+
+          for version in "${versions[@]}"; do
+            ref="${version_refs[$version]}"
+            safe_version="${version//\//-}"
+            version_dir="${RUNNER_TEMP}/find-my-basic-${safe_version}"
+            git worktree add --detach "$version_dir" "$ref"
             (
               cd "$version_dir"
               pnpm install --frozen-lockfile
-              pnpm build --base="/find-my-basic/${tag}/"
+              pnpm build --base="/find-my-basic/${version}/"
             )
-            mkdir -p "_site/${tag}"
-            cp -R "$version_dir/dist/." "_site/${tag}/"
+            mkdir -p "_site/${version}"
+            cp -R "$version_dir/dist/." "_site/${version}/"
             git worktree remove "$version_dir" --force
           done
 
@@ -66,8 +83,8 @@ jobs:
             echo '<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Find My Basic Versions</title>'
             echo '<style>body{margin:0;padding:64px 24px;background:#f4f1e9;color:#171713;font:16px/1.6 system-ui,sans-serif}main{max-width:760px;margin:auto}h1{font-size:clamp(40px,8vw,80px);line-height:1;letter-spacing:-.05em}a{color:inherit}li{padding:16px 0;border-top:1px solid #aaa}</style></head><body><main>'
             echo '<p>FIND MY BASIC</p><h1>Versions</h1><p><a href="../">Latest</a></p><ol>'
-            for tag in "${tags[@]}"; do
-              echo "<li><a href=\"../${tag}/\">${tag}</a></li>"
+            for version in "${versions[@]}"; do
+              echo "<li><a href=\"../${version}/\">${version}</a></li>"
             done
             echo '</ol></main></body></html>'
           } > _site/versions/index.html
