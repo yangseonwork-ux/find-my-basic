@@ -27,3 +27,4 @@ git push origin v2.0.0
 ```
 
 GitHub Actions가 최신 버전과 모든 `v*` 태그를 각 경로에 자동으로 빌드해 배포합니다.
+
