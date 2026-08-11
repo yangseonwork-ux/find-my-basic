@@ -11,6 +11,17 @@ pnpm dev
 
 프로덕션 빌드는 `pnpm build`로 확인합니다.
 
+## Google login
+
+로그인은 Supabase Auth와 Google OAuth를 사용합니다. 브라우저에는 Supabase project URL과 publishable key만 포함되며, Google client secret은 Supabase의 비공개 Auth 설정에만 저장합니다.
+
+- Supabase project: `fnqhuivnuwmibrtagcwu`
+- Google OAuth callback: `https://fnqhuivnuwmibrtagcwu.supabase.co/auth/v1/callback`
+- Production redirect: `https://yangseonwork-ux.github.io/find-my-basic/**`
+- Local redirect: `http://localhost:5173/**`
+
+로컬 환경에서는 `.env.development`의 공개 설정을 사용합니다. OAuth provider를 교체할 때는 `.env.example` 형식을 유지하고 비밀키를 `VITE_` 환경변수에 넣지 않습니다.
+
 ## Versioning
 
 - `main`: 계속 개선되는 최신 버전

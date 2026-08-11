@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { products } from "./data/products";
+import { isSupabaseConfigured, supabase } from "./lib/supabase";
 
 const questions = [
   {
@@ -58,6 +59,46 @@ function ArrowIcon({ direction = "right" }) {
   );
 }
 
+function GoogleIcon() {
+  return (
+    <svg className="google-icon" viewBox="0 0 18 18" aria-hidden="true">
+      <path fill="#4285F4" d="M17.64 9.205c0-.638-.057-1.252-.164-1.841H9v3.482h4.844a4.14 4.14 0 0 1-1.797 2.715v2.258h2.909c1.702-1.567 2.684-3.877 2.684-6.614Z" />
+      <path fill="#34A853" d="M9 18c2.43 0 4.468-.806 5.956-2.181l-2.91-2.258c-.805.54-1.835.86-3.046.86-2.344 0-4.328-1.585-5.037-3.714H.957v2.332A9 9 0 0 0 9 18Z" />
+      <path fill="#FBBC05" d="M3.963 10.707A5.41 5.41 0 0 1 3.682 9c0-.592.102-1.167.281-1.707V4.961H.957A9 9 0 0 0 0 9c0 1.452.347 2.827.957 4.039l3.006-2.332Z" />
+      <path fill="#EA4335" d="M9 3.58c1.321 0 2.507.454 3.442 1.346l2.58-2.58C13.464.891 11.426 0 9 0A9 9 0 0 0 .957 4.961l3.006 2.332C4.672 5.164 6.656 3.58 9 3.58Z" />
+    </svg>
+  );
+}
+
+function AuthControl({ session, loading, error, onSignIn, onSignOut, dark = false }) {
+  const user = session?.user;
+  const displayName = user?.user_metadata?.full_name || user?.user_metadata?.name || user?.email;
+  const avatarUrl = user?.user_metadata?.avatar_url;
+
+  return (
+    <div className={`auth-control ${dark ? "auth-control-dark" : ""}`}>
+      {user ? (
+        <div className="auth-user">
+          {avatarUrl ? <img src={avatarUrl} alt="" referrerPolicy="no-referrer" /> : null}
+          <span title={user.email}>{displayName}</span>
+          <button type="button" onClick={onSignOut} disabled={loading}>로그아웃</button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="google-login-button"
+          onClick={onSignIn}
+          disabled={loading || !isSupabaseConfigured}
+        >
+          <GoogleIcon />
+          <span>{loading ? "연결 중…" : "Google 로그인"}</span>
+        </button>
+      )}
+      {error ? <p className="auth-error" role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
 function App() {
   const [screen, setScreen] = useState("home");
   const [step, setStep] = useState(0);
@@ -65,6 +106,9 @@ function App() {
   const [answers, setAnswers] = useState({ occasion: "", style: "", item: "" });
   const [selectedProductId, setSelectedProductId] = useState(null);
   const [likedProductIds, setLikedProductIds] = useState([]);
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(isSupabaseConfigured);
+  const [authError, setAuthError] = useState("");
 
   const recommendations = useMemo(() => {
     if (!answers.item) return [];
@@ -88,6 +132,73 @@ function App() {
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "instant" });
   }, [screen, step, selectedProductId]);
+
+  useEffect(() => {
+    if (!supabase) {
+      setAuthLoading(false);
+      setAuthError("로그인 설정이 아직 연결되지 않았어요.");
+      return undefined;
+    }
+
+    let active = true;
+
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return;
+      if (error) setAuthError("로그인 상태를 확인하지 못했어요. 잠시 후 다시 시도해주세요.");
+      setSession(data.session);
+      setAuthLoading(false);
+    });
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!active) return;
+      setSession(nextSession);
+      setAuthLoading(false);
+      setAuthError("");
+    });
+
+    return () => {
+      active = false;
+      authListener.subscription.unsubscribe();
+    };
+  }, []);
+
+  const signInWithGoogle = async () => {
+    if (!supabase) return;
+
+    setAuthLoading(true);
+    setAuthError("");
+    const redirectTo = new URL(import.meta.env.BASE_URL, window.location.origin).toString();
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo },
+    });
+
+    if (error) {
+      setAuthLoading(false);
+      setAuthError("Google 로그인을 시작하지 못했어요. 잠시 후 다시 시도해주세요.");
+    }
+  };
+
+  const signOut = async () => {
+    if (!supabase) return;
+
+    setAuthLoading(true);
+    setAuthError("");
+    const { error } = await supabase.auth.signOut();
+    setAuthLoading(false);
+
+    if (error) setAuthError("로그아웃하지 못했어요. 잠시 후 다시 시도해주세요.");
+  };
+
+  const authControl = (
+    <AuthControl
+      session={session}
+      loading={authLoading}
+      error={authError}
+      onSignIn={signInWithGoogle}
+      onSignOut={signOut}
+    />
+  );
 
   const toggleLike = (productId) => {
     setLikedProductIds((current) =>
@@ -131,7 +242,17 @@ function App() {
       <main className="home-page">
         <div className="home-grid" aria-hidden="true" />
         <section className="home-content">
-          <p className="wordmark">FIND MY BASIC</p>
+          <div className="home-header">
+            <p className="wordmark">FIND MY BASIC</p>
+            <AuthControl
+              session={session}
+              loading={authLoading}
+              error={authError}
+              onSignIn={signInWithGoogle}
+              onSignOut={signOut}
+              dark
+            />
+          </div>
           <div className="home-copy">
             <p className="kicker">LESS CHOICE, BETTER BASICS.</p>
             <h1>
@@ -174,7 +295,10 @@ function App() {
       <main className="question-page app-shell">
         <header className="site-header">
           <button className="text-logo" onClick={() => setScreen("home")}>FIND MY BASIC</button>
-          <span>LESS, BUT BETTER.</span>
+          <div className="site-header-actions">
+            <span>LESS, BUT BETTER.</span>
+            {authControl}
+          </div>
         </header>
 
         <section className="question-layout">
@@ -280,7 +404,10 @@ function App() {
     <main className="results-page app-shell">
       <header className="site-header">
         <button className="text-logo" onClick={() => setScreen("home")}>FIND MY BASIC</button>
-        <span>LESS, BUT BETTER.</span>
+        <div className="site-header-actions">
+          <span>LESS, BUT BETTER.</span>
+          {authControl}
+        </div>
       </header>
 
       <section className="results-hero">
