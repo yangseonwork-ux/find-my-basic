@@ -39,6 +39,7 @@ const styleCopy = {
 
 const formatPrice = (price) => `${new Intl.NumberFormat("ko-KR").format(price)}원`;
 const titleCase = (value) => value.charAt(0).toUpperCase() + value.slice(1);
+const resolvePublicImage = (path) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, "")}`;
 
 function HeartIcon({ filled = false }) {
   return (
@@ -376,7 +377,7 @@ function App() {
 
         <article className="detail-layout">
           <div className="detail-image-wrap">
-            <img src={selectedProduct.image} alt={`${selectedProduct.name} 상품 이미지`} />
+            <img src={resolvePublicImage(selectedProduct.image)} alt={`${selectedProduct.name} 상품 이미지`} />
           </div>
           <div className="detail-info">
             <div>
@@ -465,7 +466,7 @@ function App() {
                     onClick={() => { setSelectedProductId(product.id); setScreen("detail"); }}
                     aria-label={`${product.name} 상세 보기`}
                   >
-                    <img src={product.image} alt={`${product.name} 상품 이미지`} />
+                    <img src={resolvePublicImage(product.image)} alt={`${product.name} 상품 이미지`} />
                   </button>
                   <span className="card-index">0{index + 1}</span>
                   <button
