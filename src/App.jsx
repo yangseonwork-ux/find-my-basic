@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { products } from "./data/products";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
 
@@ -40,6 +40,117 @@ const styleCopy = {
 const formatPrice = (price) => `${new Intl.NumberFormat("ko-KR").format(price)}원`;
 const titleCase = (value) => value.charAt(0).toUpperCase() + value.slice(1);
 const resolvePublicImage = (path) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, "")}`;
+const kakaoPostcodeScript = "https://t1.kakaocdn.net/mapjsapi/bundle/postcode/prod/postcode.v2.js";
+const cartStorageKey = "find-my-basic-cart-v1";
+const orderStorageKey = "find-my-basic-orders-v1";
+const pendingCheckoutStorageKey = "find-my-basic-pending-checkout-v1";
+const baseShippingFee = 3000;
+const freeShippingThreshold = 50000;
+const productIds = new Set(products.map((product) => product.id));
+
+function readStoredList(key) {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(key) || "[]");
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeLineItems(items) {
+  const normalized = new Map();
+
+  if (!Array.isArray(items)) return [];
+
+  items.forEach((item) => {
+    if (!productIds.has(item?.productId)) return;
+
+    const quantity = Number(item.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1) return;
+
+    const previousQuantity = normalized.get(item.productId)?.quantity || 0;
+    normalized.set(item.productId, {
+      productId: item.productId,
+      quantity: Math.min(10, previousQuantity + quantity),
+    });
+  });
+
+  return [...normalized.values()];
+}
+
+function createEmptyOrderForm() {
+  return {
+    recipientName: "",
+    phone: "",
+    email: "",
+    postcode: "",
+    address: "",
+    detailAddress: "",
+    deliveryRequest: "",
+  };
+}
+
+function createOrderNumber() {
+  const date = new Date();
+  const datePart = [date.getFullYear(), date.getMonth() + 1, date.getDate()]
+    .map((value) => String(value).padStart(2, "0"))
+    .join("");
+  const randomPart = crypto.randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase();
+  return `FMB-${datePart}-${randomPart}`;
+}
+
+let kakaoPostcodeLoader;
+
+function loadKakaoPostcode() {
+  if (window.kakao?.Postcode) return Promise.resolve();
+  if (kakaoPostcodeLoader) return kakaoPostcodeLoader;
+
+  kakaoPostcodeLoader = new Promise((resolve, reject) => {
+    const existingScript = document.querySelector(`script[src="${kakaoPostcodeScript}"]`);
+    const script = existingScript || document.createElement("script");
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      script.remove();
+      reject(new Error("Kakao Postcode script timed out."));
+    }, 10000);
+
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      script.removeEventListener("load", handleLoad);
+      script.removeEventListener("error", handleError);
+    };
+
+    const handleLoad = () => {
+      cleanup();
+      if (window.kakao?.Postcode) {
+        resolve();
+        return;
+      }
+
+      script.remove();
+      reject(new Error("Kakao Postcode constructor is unavailable."));
+    };
+    const handleError = () => {
+      cleanup();
+      script.remove();
+      reject(new Error("Kakao Postcode script failed to load."));
+    };
+
+    script.addEventListener("load", handleLoad, { once: true });
+    script.addEventListener("error", handleError, { once: true });
+
+    if (!existingScript) {
+      script.src = kakaoPostcodeScript;
+      script.async = true;
+      document.head.appendChild(script);
+    }
+  }).catch((error) => {
+    kakaoPostcodeLoader = undefined;
+    throw error;
+  });
+
+  return kakaoPostcodeLoader;
+}
 
 function HeartIcon({ filled = false }) {
   return (
@@ -57,6 +168,79 @@ function ArrowIcon({ direction = "right" }) {
     <svg className={direction === "left" ? "flip" : ""} viewBox="0 0 24 24" aria-hidden="true">
       <path d="M5 12h14M13 6l6 6-6 6" />
     </svg>
+  );
+}
+
+function CartIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 4h2l2.2 10.2a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 2-1.6L20 7H6" />
+      <circle cx="9.5" cy="20" r="1" />
+      <circle cx="17.5" cy="20" r="1" />
+    </svg>
+  );
+}
+
+function CartShortcut({ count, onClick, dark = false }) {
+  return (
+    <button
+      type="button"
+      className={`cart-shortcut ${dark ? "cart-shortcut-dark" : ""}`}
+      onClick={onClick}
+      aria-label={`장바구니, 상품 ${count}개`}
+    >
+      <CartIcon />
+      <span>{count}</span>
+    </button>
+  );
+}
+
+function QuantityControl({ quantity, onChange, compact = false }) {
+  return (
+    <div className={`quantity-control ${compact ? "compact" : ""}`} aria-label="수량 선택">
+      <button type="button" onClick={() => onChange(Math.max(1, quantity - 1))} disabled={quantity <= 1} aria-label="수량 줄이기">−</button>
+      <span aria-live="polite">{quantity}</span>
+      <button type="button" onClick={() => onChange(Math.min(10, quantity + 1))} disabled={quantity >= 10} aria-label="수량 늘리기">+</button>
+    </div>
+  );
+}
+
+function OrderProductList({ items, editable = false, onQuantityChange, onRemove }) {
+  return (
+    <div className="order-product-list">
+      {items.map(({ product, quantity }) => (
+        <article className="order-product" key={product.id}>
+          <img src={resolvePublicImage(product.image)} alt={`${product.name} 상품 이미지`} />
+          <div className="order-product-info">
+            <p>{product.brand}</p>
+            <h3>{product.name}</h3>
+            <span>옵션 없음 · 수량 {quantity}</span>
+            {editable ? (
+              <div className="order-product-actions">
+                <QuantityControl compact quantity={quantity} onChange={(nextQuantity) => onQuantityChange(product.id, nextQuantity)} />
+                <button type="button" onClick={() => onRemove(product.id)}>삭제</button>
+              </div>
+            ) : null}
+          </div>
+          <strong>{formatPrice(product.price * quantity)}</strong>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function PriceSummary({ subtotal, shippingFee, isMember }) {
+  return (
+    <div className="price-summary">
+      <div><span>상품 금액</span><strong>{formatPrice(subtotal)}</strong></div>
+      <div><span>배송비</span><strong>{shippingFee === 0 ? "무료" : formatPrice(shippingFee)}</strong></div>
+      <div className="price-summary-total"><span>총 주문 금액</span><strong>{formatPrice(subtotal + shippingFee)}</strong></div>
+      <p>
+        {isMember
+          ? `회원은 상품 금액 ${formatPrice(freeShippingThreshold)} 이상 무료배송`
+          : `비회원 배송비 ${formatPrice(baseShippingFee)} · 회원은 ${formatPrice(freeShippingThreshold)} 이상 무료배송`}
+      </p>
+    </div>
   );
 }
 
@@ -100,6 +284,210 @@ function AuthControl({ session, loading, error, onSignIn, onSignOut, dark = fals
   );
 }
 
+function KakaoAddressFields({ value, onChange }) {
+  const [isPostcodeReady, setIsPostcodeReady] = useState(Boolean(window.kakao?.Postcode));
+  const [isPostcodeLoading, setIsPostcodeLoading] = useState(!window.kakao?.Postcode);
+  const [isSearching, setIsSearching] = useState(false);
+  const [isPostcodeOpen, setIsPostcodeOpen] = useState(false);
+  const [postcodeError, setPostcodeError] = useState("");
+  const detailAddressRef = useRef(null);
+  const postcodeTriggerRef = useRef(null);
+  const postcodeLayerRef = useRef(null);
+  const postcodeCloseRef = useRef(null);
+  const shouldFocusDetailRef = useRef(false);
+
+  const preparePostcode = async () => {
+    setIsPostcodeLoading(true);
+    setPostcodeError("");
+
+    try {
+      await loadKakaoPostcode();
+      setIsPostcodeReady(true);
+      return true;
+    } catch {
+      setIsPostcodeReady(false);
+      setPostcodeError("주소 검색 서비스를 불러오지 못했어요. 인터넷 연결을 확인한 뒤 다시 시도해주세요.");
+      return false;
+    } finally {
+      setIsPostcodeLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let active = true;
+
+    loadKakaoPostcode()
+      .then(() => {
+        if (!active) return;
+        setIsPostcodeReady(true);
+        setIsPostcodeLoading(false);
+      })
+      .catch(() => {
+        if (!active) return;
+        setIsPostcodeReady(false);
+        setIsPostcodeLoading(false);
+        setPostcodeError("주소 검색 서비스를 불러오지 못했어요. 인터넷 연결을 확인한 뒤 다시 시도해주세요.");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const closePostcode = (restoreFocus = true) => {
+    setIsPostcodeOpen(false);
+    setIsSearching(false);
+    if (restoreFocus) window.requestAnimationFrame(() => postcodeTriggerRef.current?.focus());
+  };
+
+  useEffect(() => {
+    if (!isPostcodeOpen) return undefined;
+
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") closePostcode();
+    };
+
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", handleKeyDown);
+    window.requestAnimationFrame(() => postcodeCloseRef.current?.focus());
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isPostcodeOpen]);
+
+  useEffect(() => {
+    if (!shouldFocusDetailRef.current || !value.address || isPostcodeOpen) return;
+
+    shouldFocusDetailRef.current = false;
+    window.requestAnimationFrame(() => detailAddressRef.current?.focus());
+  }, [isPostcodeOpen, value.address]);
+
+  const openPostcode = async () => {
+    if (!isPostcodeReady || !window.kakao?.Postcode) {
+      const loaded = await preparePostcode();
+      if (!loaded) return;
+    }
+
+    setIsSearching(true);
+    setIsPostcodeOpen(true);
+    setPostcodeError("");
+
+    window.requestAnimationFrame(() => {
+      try {
+        new window.kakao.Postcode({
+          oncomplete: (data) => {
+            const selectedAddress = data.userSelectedType === "R"
+              ? data.roadAddress || data.address
+              : data.jibunAddress || data.address;
+            const extraParts = [];
+
+            if (data.userSelectedType === "R") {
+              if (data.bname && /[동로가]$/.test(data.bname)) extraParts.push(data.bname);
+              if (data.buildingName && data.apartment === "Y") extraParts.push(data.buildingName);
+            }
+
+            const extraAddress = extraParts.length ? ` (${extraParts.join(", ")})` : "";
+            onChange({
+              postcode: data.zonecode,
+              address: `${selectedAddress}${extraAddress}`,
+              detailAddress: "",
+            });
+            shouldFocusDetailRef.current = true;
+            closePostcode(false);
+          },
+          width: "100%",
+          height: "100%",
+          maxSuggestItems: 5,
+        }).embed(postcodeLayerRef.current);
+      } catch {
+        closePostcode();
+        setPostcodeError("주소 검색창을 불러오지 못했어요. 인터넷 연결을 확인한 뒤 다시 시도해주세요.");
+      }
+    });
+  };
+
+  return (
+    <>
+      <div className="checkout-field checkout-postcode-field">
+        <label htmlFor="checkout-postcode">우편번호</label>
+        <div>
+          <input
+            id="checkout-postcode"
+            type="text"
+            value={value.postcode}
+            placeholder="우편번호"
+            readOnly
+            required
+            inputMode="numeric"
+          />
+          <button ref={postcodeTriggerRef} type="button" onClick={openPostcode} disabled={isPostcodeLoading || isSearching}>
+            {isPostcodeLoading
+              ? "불러오는 중…"
+              : isSearching
+                ? "검색 중…"
+                : postcodeError
+                  ? "다시 불러오기"
+                  : "주소 검색"}
+          </button>
+        </div>
+      </div>
+
+      <div className="checkout-field">
+        <label htmlFor="checkout-address">기본주소</label>
+        <input
+          id="checkout-address"
+          type="text"
+          value={value.address}
+          placeholder="주소 검색 버튼을 눌러주세요"
+          readOnly
+          required
+          autoComplete="address-line1"
+        />
+      </div>
+
+      <label>
+        <span>상세주소 · 선택</span>
+        <input
+          ref={detailAddressRef}
+          type="text"
+          value={value.detailAddress}
+          onChange={(event) => onChange({ detailAddress: event.target.value })}
+          placeholder="동·호수 등 상세주소"
+          autoComplete="address-line2"
+          disabled={!value.address}
+        />
+      </label>
+
+      {postcodeError ? <p className="postcode-error" role="alert">{postcodeError}</p> : null}
+      <p className="address-help">카카오 주소 검색에서 주소를 선택하면 우편번호와 기본주소가 자동으로 입력됩니다.</p>
+
+      {isPostcodeOpen ? (
+        <div className="postcode-modal" role="dialog" aria-modal="true" aria-labelledby="postcode-modal-title">
+          <span
+            className="sr-only"
+            tabIndex="0"
+            onFocus={() => (postcodeLayerRef.current?.querySelector("iframe") || postcodeCloseRef.current)?.focus()}
+          />
+          <div className="postcode-modal-panel">
+            <div className="postcode-modal-header">
+              <div>
+                <p className="eyebrow">KAKAO POSTCODE</p>
+                <h3 id="postcode-modal-title">배송지 주소 검색</h3>
+              </div>
+              <button ref={postcodeCloseRef} type="button" onClick={() => closePostcode()} aria-label="주소 검색 닫기">닫기</button>
+            </div>
+            <div ref={postcodeLayerRef} className="postcode-embed" />
+          </div>
+          <span className="sr-only" tabIndex="0" onFocus={() => postcodeCloseRef.current?.focus()} />
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 function App() {
   const [screen, setScreen] = useState("home");
   const [step, setStep] = useState(0);
@@ -110,6 +498,18 @@ function App() {
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(isSupabaseConfigured);
   const [authError, setAuthError] = useState("");
+  const [cartItems, setCartItems] = useState(() => normalizeLineItems(readStoredList(cartStorageKey)));
+  const [detailQuantity, setDetailQuantity] = useState(1);
+  const [cartNotice, setCartNotice] = useState("");
+  const [cartReturnScreen, setCartReturnScreen] = useState("results");
+  const [checkoutItems, setCheckoutItems] = useState([]);
+  const [checkoutSource, setCheckoutSource] = useState("cart");
+  const [checkoutMode, setCheckoutMode] = useState(null);
+  const [latestOrder, setLatestOrder] = useState(null);
+  const [orderConsent, setOrderConsent] = useState(false);
+  const [orderFormError, setOrderFormError] = useState("");
+  const [orderForm, setOrderForm] = useState(createEmptyOrderForm);
+  const activeCheckoutUserIdRef = useRef(null);
 
   const recommendations = useMemo(() => {
     if (!answers.item) return [];
@@ -129,10 +529,86 @@ function App() {
 
   const selectedProduct = products.find((product) => product.id === selectedProductId);
   const displayName = nickname.trim() ? `${nickname.trim()}님` : "당신";
+  const cartCount = cartItems.reduce((total, item) => total + item.quantity, 0);
+  const cartProducts = cartItems
+    .map((item) => ({ ...item, product: products.find((product) => product.id === item.productId) }))
+    .filter((item) => item.product);
+  const checkoutProducts = checkoutItems
+    .map((item) => ({ ...item, product: products.find((product) => product.id === item.productId) }))
+    .filter((item) => item.product);
+  const isMember = Boolean(session?.user);
+  const isMemberCheckout = isMember && checkoutMode === "member";
+  const cartSubtotal = cartProducts.reduce((total, item) => total + item.product.price * item.quantity, 0);
+  const checkoutSubtotal = checkoutProducts.reduce((total, item) => total + item.product.price * item.quantity, 0);
+  const getShippingFee = (subtotal, memberEligible = isMember) =>
+    memberEligible && subtotal >= freeShippingThreshold ? 0 : baseShippingFee;
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "instant" });
   }, [screen, step, selectedProductId]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(cartStorageKey, JSON.stringify(cartItems));
+    } catch {
+      // The cart remains usable for this session when browser storage is unavailable.
+    }
+  }, [cartItems]);
+
+  useEffect(() => {
+    setDetailQuantity(1);
+    setCartNotice("");
+  }, [selectedProductId]);
+
+  useEffect(() => {
+    const nextUserId = session?.user?.id || null;
+    const previousUserId = activeCheckoutUserIdRef.current;
+
+    if (!nextUserId) {
+      if (previousUserId) {
+        setOrderForm(createEmptyOrderForm());
+        setOrderConsent(false);
+        setOrderFormError("");
+      }
+      activeCheckoutUserIdRef.current = null;
+      if (!authLoading && checkoutMode === "member") setCheckoutMode(null);
+      return;
+    }
+
+    const userChanged = previousUserId !== nextUserId;
+    activeCheckoutUserIdRef.current = nextUserId;
+    const userName = session.user.user_metadata?.full_name || session.user.user_metadata?.name || "";
+    setOrderForm((current) => {
+      const nextForm = userChanged ? createEmptyOrderForm() : current;
+      return {
+        ...nextForm,
+        recipientName: nextForm.recipientName || userName,
+        email: nextForm.email || session.user.email || "",
+      };
+    });
+    if (userChanged) {
+      setOrderConsent(false);
+      setOrderFormError("");
+    }
+    setCheckoutMode((current) => (current === "guest" ? current : "member"));
+
+    try {
+      const pendingCheckout = JSON.parse(window.sessionStorage.getItem(pendingCheckoutStorageKey) || "null");
+      const pendingItems = normalizeLineItems(pendingCheckout?.items);
+      if (pendingItems.length) {
+        setCheckoutItems(pendingItems);
+        setCheckoutSource(pendingCheckout.source || "cart");
+        setScreen("checkout");
+        window.sessionStorage.removeItem(pendingCheckoutStorageKey);
+      }
+    } catch {
+      try {
+        window.sessionStorage.removeItem(pendingCheckoutStorageKey);
+      } catch {
+        // Session storage can be unavailable in strict browser privacy modes.
+      }
+    }
+  }, [authLoading, checkoutMode, session]);
 
   useEffect(() => {
     if (!supabase) {
@@ -166,6 +642,17 @@ function App() {
   const signInWithGoogle = async () => {
     if (!supabase) return;
 
+    if (screen === "checkout" && checkoutItems.length) {
+      try {
+        window.sessionStorage.setItem(
+          pendingCheckoutStorageKey,
+          JSON.stringify({ items: checkoutItems, source: checkoutSource }),
+        );
+      } catch {
+        setAuthError("로그인 후 주문서를 이어갈 수 있도록 브라우저 세션 저장을 허용해주세요.");
+        return;
+      }
+    }
     setAuthLoading(true);
     setAuthError("");
     const redirectTo = new URL(import.meta.env.BASE_URL, window.location.origin).toString();
@@ -209,6 +696,109 @@ function App() {
     );
   };
 
+  const openCart = () => {
+    setCartReturnScreen(screen === "detail" ? "detail" : screen === "results" ? "results" : "home");
+    setScreen("cart");
+  };
+
+  const addToCart = (productId, quantity) => {
+    setCartItems((current) => {
+      const existing = current.find((item) => item.productId === productId);
+      if (!existing) return [...current, { productId, quantity }];
+      return current.map((item) =>
+        item.productId === productId
+          ? { ...item, quantity: Math.min(10, item.quantity + quantity) }
+          : item,
+      );
+    });
+    setCartNotice("장바구니에 담았습니다.");
+  };
+
+  const updateCartQuantity = (productId, quantity) => {
+    setCartItems((current) => current.map((item) => (item.productId === productId ? { ...item, quantity } : item)));
+  };
+
+  const removeCartItem = (productId) => {
+    setCartItems((current) => current.filter((item) => item.productId !== productId));
+  };
+
+  const startCheckout = (items, source) => {
+    setCheckoutItems(normalizeLineItems(items));
+    setCheckoutSource(source);
+    setCheckoutMode(isMember ? "member" : null);
+    setOrderConsent(false);
+    setOrderFormError("");
+    setScreen("checkout");
+  };
+
+  const updateOrderField = (field, value) => {
+    setOrderFormError("");
+    setOrderForm((current) => ({ ...current, [field]: value }));
+  };
+
+  const updateOrderFields = (updates) => {
+    setOrderFormError("");
+    setOrderForm((current) => ({ ...current, ...updates }));
+  };
+
+  const submitOrder = (event) => {
+    event.preventDefault();
+    if (checkoutProducts.length === 0 || !orderConsent) return;
+
+    const recipientName = orderForm.recipientName.trim();
+    const phone = orderForm.phone.trim();
+    const email = orderForm.email.trim();
+    if (!recipientName || !phone || !email) {
+      setOrderFormError("수령인, 연락처, 이메일을 모두 입력해주세요.");
+      return;
+    }
+    if (!orderForm.postcode || !orderForm.address) {
+      setOrderFormError("카카오 주소 검색으로 배송지를 선택해주세요.");
+      return;
+    }
+    setOrderFormError("");
+
+    const shippingFee = getShippingFee(checkoutSubtotal, isMemberCheckout);
+    const customerType = isMemberCheckout ? "member" : "guest";
+    const order = {
+      orderNumber: createOrderNumber(),
+      status: "주문 접수",
+      customerType,
+      userId: isMemberCheckout ? session.user.id : null,
+      createdAt: new Date().toISOString(),
+      items: checkoutProducts.map(({ product, quantity }) => ({
+        productId: product.id,
+        name: product.name,
+        brand: product.brand,
+        price: product.price,
+        quantity,
+        option: null,
+      })),
+      subtotal: checkoutSubtotal,
+      shippingFee,
+      total: checkoutSubtotal + shippingFee,
+      recipient: {
+        ...orderForm,
+        recipientName,
+        phone,
+        email,
+      },
+    };
+
+    const storedOrders = readStoredList(orderStorageKey);
+    try {
+      window.localStorage.setItem(orderStorageKey, JSON.stringify([order, ...storedOrders]));
+    } catch {
+      setOrderFormError("주문 정보를 저장하지 못했어요. 브라우저 저장 공간을 확인한 뒤 다시 시도해주세요.");
+      return;
+    }
+    if (checkoutSource === "cart") setCartItems([]);
+    setLatestOrder(order);
+    setOrderConsent(false);
+    setOrderForm(createEmptyOrderForm());
+    setScreen("orderComplete");
+  };
+
   const startQuestions = () => {
     setNickname((current) => current.trim());
     setStep(0);
@@ -245,14 +835,17 @@ function App() {
         <section className="home-content">
           <div className="home-header">
             <p className="wordmark">FIND MY BASIC</p>
-            <AuthControl
-              session={session}
-              loading={authLoading}
-              error={authError}
-              onSignIn={signInWithGoogle}
-              onSignOut={signOut}
-              dark
-            />
+            <div className="home-header-actions">
+              <CartShortcut count={cartCount} onClick={openCart} dark />
+              <AuthControl
+                session={session}
+                loading={authLoading}
+                error={authError}
+                onSignIn={signInWithGoogle}
+                onSignOut={signOut}
+                dark
+              />
+            </div>
           </div>
           <div className="home-copy">
             <p className="kicker">LESS CHOICE, BETTER BASICS.</p>
@@ -298,6 +891,7 @@ function App() {
           <button className="text-logo" onClick={() => setScreen("home")}>FIND MY BASIC</button>
           <div className="site-header-actions">
             <span>LESS, BUT BETTER.</span>
+            <CartShortcut count={cartCount} onClick={openCart} />
             {authControl}
           </div>
         </header>
@@ -355,6 +949,182 @@ function App() {
     );
   }
 
+  if (screen === "cart") {
+    const shippingFee = getShippingFee(cartSubtotal);
+    return (
+      <main className="purchase-page app-shell">
+        <header className="purchase-header">
+          <button className="back-button" onClick={() => setScreen(cartReturnScreen)}>
+            <ArrowIcon direction="left" />
+            Back
+          </button>
+          <button className="text-logo" onClick={() => setScreen("home")}>FIND MY BASIC</button>
+          <div className="purchase-header-auth">{authControl}</div>
+        </header>
+
+        <section className="purchase-layout cart-layout">
+          <div className="purchase-main">
+            <div className="purchase-page-title">
+              <p className="eyebrow">YOUR CART</p>
+              <h1>장바구니</h1>
+              <span>{cartCount} ITEMS</span>
+            </div>
+
+            {cartProducts.length ? (
+              <OrderProductList
+                items={cartProducts}
+                editable
+                onQuantityChange={updateCartQuantity}
+                onRemove={removeCartItem}
+              />
+            ) : (
+              <div className="empty-cart">
+                <p>아직 담긴 상품이 없어요.</p>
+                <button type="button" onClick={() => setScreen(answers.item ? "results" : "home")}>상품 보러 가기 <ArrowIcon /></button>
+              </div>
+            )}
+          </div>
+
+          <aside className="purchase-sidebar">
+            <p className="eyebrow">ORDER SUMMARY</p>
+            <PriceSummary subtotal={cartSubtotal} shippingFee={cartProducts.length ? shippingFee : 0} isMember={isMember} />
+            <button
+              type="button"
+              className="checkout-button"
+              disabled={!cartProducts.length}
+              onClick={() => startCheckout(cartItems, "cart")}
+            >
+              주문하기 <ArrowIcon />
+            </button>
+            <p className="purchase-policy">비회원도 주문할 수 있습니다. 상품 금액 50,000원 이상 무료배송 혜택은 로그인 회원에게만 적용됩니다.</p>
+          </aside>
+        </section>
+      </main>
+    );
+  }
+
+  if (screen === "checkout") {
+    const shippingFee = getShippingFee(checkoutSubtotal, isMemberCheckout);
+    return (
+      <main className="purchase-page app-shell">
+        <header className="purchase-header">
+          <button className="back-button" onClick={() => setScreen(checkoutSource === "cart" ? "cart" : "detail")}>
+            <ArrowIcon direction="left" />
+            Back
+          </button>
+          <button className="text-logo" onClick={() => setScreen("home")}>FIND MY BASIC</button>
+          <div className="purchase-header-auth">{authControl}</div>
+        </header>
+
+        {!checkoutProducts.length ? (
+          <section className="checkout-empty empty-cart">
+            <p>주문할 상품이 없습니다.</p>
+            <button type="button" onClick={() => setScreen("cart")}>장바구니로 돌아가기 <ArrowIcon /></button>
+          </section>
+        ) : !checkoutMode && (authLoading || isMember) ? (
+          <section className="checkout-login-gate" aria-live="polite">
+            <p className="eyebrow">CHECKING SESSION</p>
+            <h1>주문 정보를 준비하고 있어요.</h1>
+          </section>
+        ) : !isMember && checkoutMode !== "guest" ? (
+          <section className="checkout-login-gate">
+            <p className="eyebrow">MEMBER OR GUEST</p>
+            <h1>어떤 방식으로 주문할까요?</h1>
+            <p>로그인 회원은 상품 금액 50,000원 이상 무료배송이며, 비회원 배송비는 3,000원입니다.</p>
+            <button type="button" className="checkout-login-button" onClick={signInWithGoogle} disabled={authLoading || !isSupabaseConfigured}>
+              <GoogleIcon /> 회원으로 주문하기
+            </button>
+            <button type="button" className="guest-checkout-button" onClick={() => setCheckoutMode("guest")}>비회원으로 주문하기</button>
+          </section>
+        ) : (
+          <form className="purchase-layout checkout-layout" onSubmit={submitOrder}>
+            <div className="purchase-main">
+              <div className="purchase-page-title">
+                <p className="eyebrow">CHECKOUT</p>
+                <h1>주문서</h1>
+                <span>{isMemberCheckout ? "MEMBER ORDER" : "GUEST ORDER"}</span>
+              </div>
+
+              <section className="checkout-section">
+                <div className="checkout-section-heading">
+                  <span>01</span>
+                  <div><p className="eyebrow">ORDER ITEMS</p><h2>주문 상품</h2></div>
+                </div>
+                <OrderProductList items={checkoutProducts} />
+              </section>
+
+              <section className="checkout-section">
+                <div className="checkout-section-heading">
+                  <span>02</span>
+                  <div><p className="eyebrow">RECIPIENT</p><h2>배송 정보</h2></div>
+                </div>
+                <div className="checkout-fields">
+                  <label>
+                    <span>수령인</span>
+                    <input required value={orderForm.recipientName} onChange={(event) => updateOrderField("recipientName", event.target.value)} autoComplete="name" placeholder="이름" />
+                  </label>
+                  <label>
+                    <span>연락처</span>
+                    <input required value={orderForm.phone} onChange={(event) => updateOrderField("phone", event.target.value)} inputMode="tel" autoComplete="tel" pattern="[0-9+ -]{9,20}" title="9~20자의 숫자와 하이픈으로 입력해주세요" placeholder="010-0000-0000" />
+                  </label>
+                  <label>
+                    <span>이메일</span>
+                    <input required type="email" value={orderForm.email} onChange={(event) => updateOrderField("email", event.target.value)} autoComplete="email" placeholder="order@example.com" />
+                  </label>
+                  <KakaoAddressFields value={orderForm} onChange={updateOrderFields} />
+                  <label>
+                    <span>배송 요청사항 · 선택</span>
+                    <input value={orderForm.deliveryRequest} onChange={(event) => updateOrderField("deliveryRequest", event.target.value)} placeholder="배송 시 요청사항을 입력해주세요" />
+                  </label>
+                </div>
+                {orderFormError ? <p className="order-form-error" role="alert">{orderFormError}</p> : null}
+              </section>
+            </div>
+
+            <aside className="purchase-sidebar checkout-sidebar">
+              <p className="eyebrow">PAYMENT SUMMARY</p>
+              <PriceSummary subtotal={checkoutSubtotal} shippingFee={shippingFee} isMember={isMemberCheckout} />
+              <label className="checkout-consent">
+                <input type="checkbox" checked={orderConsent} onChange={(event) => setOrderConsent(event.target.checked)} required />
+                <span>주문 접수를 위한 개인정보 수집 및 이용에 동의합니다.</span>
+              </label>
+              <button type="submit" className="checkout-button">{isMemberCheckout ? "회원" : "비회원"} 주문 접수하기 <ArrowIcon /></button>
+              <button type="button" className="payment-coming-button" disabled>결제하기 · 준비 중</button>
+              <p className="purchase-policy">현재 주문은 결제 없이 ‘주문 접수’ 상태로 이 브라우저에 저장됩니다. 실제 결제는 결제 서비스 선정 후 연결됩니다.</p>
+            </aside>
+          </form>
+        )}
+      </main>
+    );
+  }
+
+  if (screen === "orderComplete" && latestOrder) {
+    return (
+      <main className="order-complete-page app-shell">
+        <header className="purchase-header">
+          <span />
+          <button className="text-logo" onClick={() => setScreen("home")}>FIND MY BASIC</button>
+          <span />
+        </header>
+        <section className="order-complete-content">
+          <div className="order-complete-mark" aria-hidden="true">✓</div>
+          <p className="eyebrow">ORDER RECEIVED</p>
+          <h1>주문이 접수되었습니다.</h1>
+          <p>결제 연동 전 단계로, 주문 정보가 이 브라우저에 저장되었습니다.</p>
+          <dl className="order-complete-meta">
+            <div><dt>주문번호</dt><dd>{latestOrder.orderNumber}</dd></div>
+            <div><dt>주문 유형</dt><dd>{latestOrder.customerType === "member" ? "회원 주문" : "비회원 주문"}</dd></div>
+            <div><dt>주문상태</dt><dd>{latestOrder.status}</dd></div>
+            <div><dt>총 주문 금액</dt><dd>{formatPrice(latestOrder.total)}</dd></div>
+          </dl>
+          <button type="button" className="continue-shopping-button" onClick={() => setScreen(answers.item ? "results" : "home")}>
+            계속 쇼핑하기 <ArrowIcon />
+          </button>
+        </section>
+      </main>
+    );
+  }
+
   if (screen === "detail" && selectedProduct) {
     const liked = likedProductIds.includes(selectedProduct.id);
     return (
@@ -365,14 +1135,17 @@ function App() {
             Back
           </button>
           <p className="text-logo">FIND MY BASIC</p>
-          <button
-            className={`icon-button detail-like ${liked ? "liked" : ""}`}
-            aria-label={`${selectedProduct.name} ${liked ? "좋아요 취소" : "좋아요"}`}
-            aria-pressed={liked}
-            onClick={() => toggleLike(selectedProduct.id)}
-          >
-            <HeartIcon filled={liked} />
-          </button>
+          <div className="detail-header-actions">
+            <CartShortcut count={cartCount} onClick={openCart} />
+            <button
+              className={`icon-button detail-like ${liked ? "liked" : ""}`}
+              aria-label={`${selectedProduct.name} ${liked ? "좋아요 취소" : "좋아요"}`}
+              aria-pressed={liked}
+              onClick={() => toggleLike(selectedProduct.id)}
+            >
+              <HeartIcon filled={liked} />
+            </button>
+          </div>
         </header>
 
         <article className="detail-layout">
@@ -395,6 +1168,30 @@ function App() {
               ))}
             </div>
             <p className="detail-note">당신의 선택을 바탕으로 남긴 네 가지 중 하나예요.</p>
+            <section className="purchase-panel" aria-label="구매 옵션">
+              <div className="purchase-quantity">
+                <div>
+                  <span>QUANTITY</span>
+                  <p>옵션 없음</p>
+                </div>
+                <QuantityControl quantity={detailQuantity} onChange={setDetailQuantity} />
+              </div>
+              <div className="purchase-total">
+                <span>상품 금액</span>
+                <strong>{formatPrice(selectedProduct.price * detailQuantity)}</strong>
+              </div>
+              <div className="purchase-actions">
+                <button type="button" className="cart-add-button" onClick={() => addToCart(selectedProduct.id, detailQuantity)}>장바구니 담기</button>
+                <button
+                  type="button"
+                  className="buy-now-button"
+                  onClick={() => startCheckout([{ productId: selectedProduct.id, quantity: detailQuantity }], "direct")}
+                >
+                  바로 주문하기 <ArrowIcon />
+                </button>
+              </div>
+              {cartNotice ? <p className="cart-notice" role="status">{cartNotice}</p> : null}
+            </section>
           </div>
         </article>
       </main>
@@ -407,6 +1204,7 @@ function App() {
         <button className="text-logo" onClick={() => setScreen("home")}>FIND MY BASIC</button>
         <div className="site-header-actions">
           <span>LESS, BUT BETTER.</span>
+          <CartShortcut count={cartCount} onClick={openCart} />
           {authControl}
         </div>
       </header>
