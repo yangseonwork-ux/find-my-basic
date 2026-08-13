@@ -1408,6 +1408,19 @@ button svg {
   font-size: 28px;
 }
 
+.payment-status-mark {
+  animation: payment-pulse 1.1s ease-in-out infinite alternate;
+}
+
+.payment-fail-mark {
+  background: #ffb4a8;
+}
+
+@keyframes payment-pulse {
+  from { transform: scale(0.94); opacity: 0.68; }
+  to { transform: scale(1); opacity: 1; }
+}
+
 .order-complete-content h1 {
   margin: 20px 0 14px;
   font-size: clamp(38px, 10vw, 62px);
@@ -1453,6 +1466,21 @@ button svg {
 
 .continue-shopping-button {
   width: 100%;
+}
+
+.payment-error-actions {
+  margin-top: 30px;
+}
+
+.payment-secondary-button {
+  margin-top: 8px;
+  background: transparent;
+  color: var(--ink);
+}
+
+.continue-shopping-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 @media (min-width: 760px) {

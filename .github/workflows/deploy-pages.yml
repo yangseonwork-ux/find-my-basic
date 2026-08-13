@@ -20,6 +20,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Public browser key only. Never add TOSS_SECRET_KEY to this Pages workflow.
+      VITE_TOSS_CLIENT_KEY: ${{ vars.VITE_TOSS_CLIENT_KEY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,9 +40,17 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - name: Validate test payment client key
+        run: |
+          if [[ "$VITE_TOSS_CLIENT_KEY" != test_ck_* ]]; then
+            echo "::error::Repository Variable VITE_TOSS_CLIENT_KEY must contain a test_ck_ key for this public test site."
+            exit 1
+          fi
+
       - name: Build latest version
         run: |
           pnpm install --frozen-lockfile
+          pnpm test
           pnpm build --base=/find-my-basic/
           mkdir -p _site
           cp -R dist/. _site/

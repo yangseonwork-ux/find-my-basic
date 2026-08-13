@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { products } from "./data/products";
+import {
+  confirmPayment,
+  createPaymentOrder,
+  isLivePayment,
+  isPaymentConfigured,
+  requestTossPayment,
+} from "./lib/payments";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
 
 const questions = [
@@ -42,8 +49,8 @@ const titleCase = (value) => value.charAt(0).toUpperCase() + value.slice(1);
 const resolvePublicImage = (path) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, "")}`;
 const kakaoPostcodeScript = "https://t1.kakaocdn.net/mapjsapi/bundle/postcode/prod/postcode.v2.js";
 const cartStorageKey = "find-my-basic-cart-v1";
-const orderStorageKey = "find-my-basic-orders-v1";
 const pendingCheckoutStorageKey = "find-my-basic-pending-checkout-v1";
+const pendingPaymentStorageKey = "find-my-basic-pending-payment-v1";
 const baseShippingFee = 3000;
 const freeShippingThreshold = 50000;
 const productIds = new Set(products.map((product) => product.id));
@@ -90,13 +97,37 @@ function createEmptyOrderForm() {
   };
 }
 
-function createOrderNumber() {
-  const date = new Date();
-  const datePart = [date.getFullYear(), date.getMonth() + 1, date.getDate()]
-    .map((value) => String(value).padStart(2, "0"))
-    .join("");
-  const randomPart = crypto.randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase();
-  return `FMB-${datePart}-${randomPart}`;
+function readPaymentRedirect() {
+  const params = new URLSearchParams(window.location.search);
+  const result = params.get("paymentResult");
+  if (result !== "success" && result !== "fail") return null;
+
+  return {
+    result,
+    paymentKey: (params.get("paymentKey") || "").slice(0, 200),
+    orderId: (params.get("orderId") || "").slice(0, 64),
+    amount: params.get("amount") || "",
+    code: (params.get("code") || "PAYMENT_FAILED").slice(0, 80),
+    message: (params.get("message") || "결제가 완료되지 않았습니다.").slice(0, 300),
+  };
+}
+
+function readPendingPayment() {
+  try {
+    const value = JSON.parse(window.sessionStorage.getItem(pendingPaymentStorageKey) || "null");
+    return value && typeof value === "object" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPaymentRedirect() {
+  const cleanUrl = new URL(import.meta.env.BASE_URL, window.location.origin);
+  window.history.replaceState({}, "", cleanUrl);
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 let kakaoPostcodeLoader;
@@ -489,7 +520,12 @@ function KakaoAddressFields({ value, onChange }) {
 }
 
 function App() {
-  const [screen, setScreen] = useState("home");
+  const [paymentRedirect] = useState(readPaymentRedirect);
+  const [screen, setScreen] = useState(() => {
+    if (paymentRedirect?.result === "success") return "paymentSuccess";
+    if (paymentRedirect?.result === "fail") return "paymentFail";
+    return "home";
+  });
   const [step, setStep] = useState(0);
   const [nickname, setNickname] = useState("");
   const [answers, setAnswers] = useState({ occasion: "", style: "", item: "" });
@@ -506,6 +542,10 @@ function App() {
   const [checkoutSource, setCheckoutSource] = useState("cart");
   const [checkoutMode, setCheckoutMode] = useState(null);
   const [latestOrder, setLatestOrder] = useState(null);
+  const [paymentSubmitting, setPaymentSubmitting] = useState(false);
+  const [paymentStatus, setPaymentStatus] = useState("confirming");
+  const [paymentError, setPaymentError] = useState("");
+  const [paymentRetryNonce, setPaymentRetryNonce] = useState(0);
   const [orderConsent, setOrderConsent] = useState(false);
   const [orderFormError, setOrderFormError] = useState("");
   const [orderForm, setOrderForm] = useState(createEmptyOrderForm);
@@ -639,6 +679,64 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (screen !== "paymentSuccess" || paymentRedirect?.result !== "success" || authLoading) return undefined;
+
+    let active = true;
+    const confirmRedirectedPayment = async () => {
+      setPaymentStatus("confirming");
+      setPaymentError("");
+
+      const pendingPayment = readPendingPayment();
+      const checkoutToken = pendingPayment?.orderId === paymentRedirect.orderId
+        ? pendingPayment.checkoutToken || ""
+        : "";
+
+      try {
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const result = await confirmPayment({
+            paymentKey: paymentRedirect.paymentKey,
+            orderId: paymentRedirect.orderId,
+            amount: paymentRedirect.amount,
+            checkoutToken,
+          });
+
+          if (result?.pending) {
+            await wait(1200);
+            continue;
+          }
+          if (!result?.order) throw new Error("결제 승인 결과를 확인하지 못했습니다.");
+          if (!active) return;
+
+          if (pendingPayment?.source === "cart") setCartItems([]);
+          try {
+            window.sessionStorage.removeItem(pendingPaymentStorageKey);
+          } catch {
+            // A confirmed server order is still authoritative when session storage is unavailable.
+          }
+          clearPaymentRedirect();
+          setLatestOrder(result.order);
+          setOrderConsent(false);
+          setOrderForm(createEmptyOrderForm());
+          setPaymentStatus("paid");
+          setScreen("orderComplete");
+          return;
+        }
+
+        throw new Error("결제 승인이 처리 중입니다. 잠시 후 다시 확인해주세요.");
+      } catch (error) {
+        if (!active) return;
+        setPaymentStatus("error");
+        setPaymentError(error instanceof Error ? error.message : "결제 승인을 확인하지 못했습니다.");
+      }
+    };
+
+    confirmRedirectedPayment();
+    return () => {
+      active = false;
+    };
+  }, [authLoading, paymentRedirect, paymentRetryNonce, screen]);
+
   const signInWithGoogle = async () => {
     if (!supabase) return;
 
@@ -741,9 +839,9 @@ function App() {
     setOrderForm((current) => ({ ...current, ...updates }));
   };
 
-  const submitOrder = (event) => {
+  const submitOrder = async (event) => {
     event.preventDefault();
-    if (checkoutProducts.length === 0 || !orderConsent) return;
+    if (checkoutProducts.length === 0 || !orderConsent || paymentSubmitting) return;
 
     const recipientName = orderForm.recipientName.trim();
     const phone = orderForm.phone.trim();
@@ -756,47 +854,74 @@ function App() {
       setOrderFormError("카카오 주소 검색으로 배송지를 선택해주세요.");
       return;
     }
-    setOrderFormError("");
-
-    const shippingFee = getShippingFee(checkoutSubtotal, isMemberCheckout);
-    const customerType = isMemberCheckout ? "member" : "guest";
-    const order = {
-      orderNumber: createOrderNumber(),
-      status: "주문 접수",
-      customerType,
-      userId: isMemberCheckout ? session.user.id : null,
-      createdAt: new Date().toISOString(),
-      items: checkoutProducts.map(({ product, quantity }) => ({
-        productId: product.id,
-        name: product.name,
-        brand: product.brand,
-        price: product.price,
-        quantity,
-        option: null,
-      })),
-      subtotal: checkoutSubtotal,
-      shippingFee,
-      total: checkoutSubtotal + shippingFee,
-      recipient: {
-        ...orderForm,
-        recipientName,
-        phone,
-        email,
-      },
-    };
-
-    const storedOrders = readStoredList(orderStorageKey);
-    try {
-      window.localStorage.setItem(orderStorageKey, JSON.stringify([order, ...storedOrders]));
-    } catch {
-      setOrderFormError("주문 정보를 저장하지 못했어요. 브라우저 저장 공간을 확인한 뒤 다시 시도해주세요.");
+    if (!isPaymentConfigured) {
+      setOrderFormError("토스페이먼츠 결제 환경변수를 설정해주세요.");
       return;
     }
-    if (checkoutSource === "cart") setCartItems([]);
-    setLatestOrder(order);
-    setOrderConsent(false);
+    setOrderFormError("");
+    const customerType = isMemberCheckout ? "member" : "guest";
+    const items = checkoutProducts.map(({ product, quantity }) => ({ productId: product.id, quantity }));
+    setPaymentSubmitting(true);
+
+    try {
+      const order = await createPaymentOrder({
+        customerType,
+        items,
+        recipient: {
+          ...orderForm,
+          recipientName,
+          phone,
+          email,
+        },
+      });
+
+      window.sessionStorage.setItem(pendingPaymentStorageKey, JSON.stringify({
+        orderId: order.orderId,
+        checkoutToken: order.checkoutToken,
+        items,
+        source: checkoutSource,
+        customerType,
+      }));
+
+      await requestTossPayment({
+        order,
+        customerName: recipientName,
+        customerEmail: email,
+        userId: isMemberCheckout ? session.user.id : null,
+      });
+    } catch (error) {
+      try {
+        window.sessionStorage.removeItem(pendingPaymentStorageKey);
+      } catch {
+        // Ignore storage cleanup errors and keep the actionable payment error visible.
+      }
+      setPaymentSubmitting(false);
+      setOrderFormError(error instanceof Error ? error.message : "결제를 시작하지 못했습니다.");
+    }
+  };
+
+  const retryFailedPayment = () => {
+    const pendingPayment = readPendingPayment();
+    const restoredItems = normalizeLineItems(pendingPayment?.items);
+    clearPaymentRedirect();
+
+    if (!restoredItems.length) {
+      setScreen("home");
+      return;
+    }
+
+    try {
+      window.sessionStorage.removeItem(pendingPaymentStorageKey);
+    } catch {
+      // The checkout can still be reconstructed from the in-memory copy.
+    }
+    setCheckoutItems(restoredItems);
+    setCheckoutSource(pendingPayment.source || "cart");
+    setCheckoutMode(pendingPayment.customerType === "member" && session?.user ? "member" : "guest");
     setOrderForm(createEmptyOrderForm());
-    setScreen("orderComplete");
+    setOrderConsent(false);
+    setOrderFormError("");
+    setScreen("checkout");
   };
 
   const startQuestions = () => {
@@ -1003,6 +1128,69 @@ function App() {
     );
   }
 
+  if (screen === "paymentSuccess") {
+    return (
+      <main className="order-complete-page app-shell">
+        <header className="purchase-header">
+          <span />
+          <span className="text-logo">FIND MY BASIC</span>
+          <span />
+        </header>
+        <section className="order-complete-content" aria-live="polite">
+          <div className="order-complete-mark payment-status-mark" aria-hidden="true">
+            {paymentStatus === "error" ? "!" : "…"}
+          </div>
+          <p className="eyebrow">TEST PAYMENT</p>
+          <h1>{paymentStatus === "error" ? "결제 승인을 확인하지 못했습니다." : "결제 승인을 확인하고 있습니다."}</h1>
+          <p>
+            {paymentStatus === "error"
+              ? paymentError
+              : "창을 닫거나 뒤로 이동하지 마세요. 중복 요청은 같은 승인 결과로 처리됩니다."}
+          </p>
+          {paymentStatus === "error" ? (
+            <div className="payment-error-actions">
+              <button
+                type="button"
+                className="continue-shopping-button"
+                onClick={() => setPaymentRetryNonce((value) => value + 1)}
+              >
+                다시 확인하기 <ArrowIcon />
+              </button>
+              <button type="button" className="continue-shopping-button payment-secondary-button" onClick={retryFailedPayment}>
+                주문서로 돌아가기 <ArrowIcon />
+              </button>
+            </div>
+          ) : null}
+        </section>
+      </main>
+    );
+  }
+
+  if (screen === "paymentFail") {
+    return (
+      <main className="order-complete-page app-shell">
+        <header className="purchase-header">
+          <span />
+          <button className="text-logo" onClick={() => { clearPaymentRedirect(); setScreen("home"); }}>FIND MY BASIC</button>
+          <span />
+        </header>
+        <section className="order-complete-content">
+          <div className="order-complete-mark payment-fail-mark" aria-hidden="true">!</div>
+          <p className="eyebrow">PAYMENT NOT COMPLETED</p>
+          <h1>결제가 완료되지 않았습니다.</h1>
+          <p>{paymentRedirect?.message || "결제가 취소되었거나 인증 중 오류가 발생했습니다."}</p>
+          <dl className="order-complete-meta">
+            <div><dt>오류 코드</dt><dd>{paymentRedirect?.code || "PAYMENT_FAILED"}</dd></div>
+            {paymentRedirect?.orderId ? <div><dt>주문번호</dt><dd>{paymentRedirect.orderId}</dd></div> : null}
+          </dl>
+          <button type="button" className="continue-shopping-button" onClick={retryFailedPayment} disabled={authLoading}>
+            주문서에서 다시 시도하기 <ArrowIcon />
+          </button>
+        </section>
+      </main>
+    );
+  }
+
   if (screen === "checkout") {
     const shippingFee = getShippingFee(checkoutSubtotal, isMemberCheckout);
     return (
@@ -1086,11 +1274,23 @@ function App() {
               <PriceSummary subtotal={checkoutSubtotal} shippingFee={shippingFee} isMember={isMemberCheckout} />
               <label className="checkout-consent">
                 <input type="checkbox" checked={orderConsent} onChange={(event) => setOrderConsent(event.target.checked)} required />
-                <span>주문 접수를 위한 개인정보 수집 및 이용에 동의합니다.</span>
+                <span>결제 및 배송을 위한 개인정보 수집 및 이용에 동의합니다.</span>
               </label>
-              <button type="submit" className="checkout-button">{isMemberCheckout ? "회원" : "비회원"} 주문 접수하기 <ArrowIcon /></button>
-              <button type="button" className="payment-coming-button" disabled>결제하기 · 준비 중</button>
-              <p className="purchase-policy">현재 주문은 결제 없이 ‘주문 접수’ 상태로 이 브라우저에 저장됩니다. 실제 결제는 결제 서비스 선정 후 연결됩니다.</p>
+              <button
+                type="submit"
+                className="checkout-button"
+                disabled={paymentSubmitting || !isPaymentConfigured}
+              >
+                {paymentSubmitting ? "결제 준비 중…" : isLivePayment ? "결제하기" : "토스 테스트 결제하기"} <ArrowIcon />
+              </button>
+              {!isPaymentConfigured ? (
+                <p className="order-form-error" role="status">클라이언트 키와 서버 승인 API 설정이 필요합니다.</p>
+              ) : null}
+              <p className="purchase-policy">
+                {isLivePayment
+                  ? "주문 금액은 서버에서 다시 검증하며, 결제 승인 시 실제 금액이 청구됩니다."
+                  : "테스트 키 전용 결제입니다. 주문 금액은 서버에서 다시 계산하며 실제 금액은 차감되지 않습니다."}
+              </p>
             </aside>
           </form>
         )}
@@ -1108,14 +1308,15 @@ function App() {
         </header>
         <section className="order-complete-content">
           <div className="order-complete-mark" aria-hidden="true">✓</div>
-          <p className="eyebrow">ORDER RECEIVED</p>
-          <h1>주문이 접수되었습니다.</h1>
-          <p>결제 연동 전 단계로, 주문 정보가 이 브라우저에 저장되었습니다.</p>
+          <p className="eyebrow">PAYMENT APPROVED</p>
+          <h1>{isLivePayment ? "결제가 완료되었습니다." : "테스트 결제가 완료되었습니다."}</h1>
+          <p>{isLivePayment ? "결제 승인 결과가 서버 주문에 안전하게 반영되었습니다." : "토스페이먼츠 테스트 승인 결과가 서버 주문에 안전하게 반영되었습니다."}</p>
           <dl className="order-complete-meta">
             <div><dt>주문번호</dt><dd>{latestOrder.orderNumber}</dd></div>
             <div><dt>주문 유형</dt><dd>{latestOrder.customerType === "member" ? "회원 주문" : "비회원 주문"}</dd></div>
             <div><dt>주문상태</dt><dd>{latestOrder.status}</dd></div>
             <div><dt>총 주문 금액</dt><dd>{formatPrice(latestOrder.total)}</dd></div>
+            {latestOrder.paymentMethod ? <div><dt>결제수단</dt><dd>{latestOrder.paymentMethod}</dd></div> : null}
           </dl>
           <button type="button" className="continue-shopping-button" onClick={() => setScreen(answers.item ? "results" : "home")}>
             계속 쇼핑하기 <ArrowIcon />
